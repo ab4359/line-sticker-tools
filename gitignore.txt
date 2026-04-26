@@ -1,0 +1,24 @@
+# Compiled binaries
+line_renamer
+line_renamer_x86
+line_renamer_arm64
+
+# Runtime output directories
+downloads/
+unzipped/
+
+# Incomplete downloads
+*.part
+
+# Log files
+results.jsonl
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS noise
+.DS_Store
+.AppleDouble
+.LSOverride
