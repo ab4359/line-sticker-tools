@@ -12,7 +12,7 @@ pip3 install requests tqdm
 
 ## Configuration
 
-Open `sticker_downloader_r2.py` and adjust the constants at the top of the file:
+Open `sticker_downloader.py` and adjust the constants at the top of the file:
 
 | Constant | Default | Description |
 |----------|---------|-------------|
@@ -31,7 +31,7 @@ Open `sticker_downloader_r2.py` and adjust the constants at the top of the file:
 
 ```bash
 cd downloader
-python3 sticker_downloader_r2.py
+python3 sticker_downloader.py
 ```
 
 ## Output
