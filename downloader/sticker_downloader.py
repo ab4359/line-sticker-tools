@@ -21,8 +21,8 @@ PACK_URLS = [
 # Labels must stay in the same order as PACK_URLS
 PACK_LABELS = ["animated", "static"]
 
-START_ID     = 100
-END_ID       = 120
+START_ID     = 19000
+END_ID       = 19026
 
 DOWNLOAD_DIR = "downloads"
 UNZIP_DIR    = "unzipped"
@@ -31,6 +31,9 @@ LOG_FILE     = "results.jsonl"   # one JSON object per line — safe to append
 MAX_WORKERS  = 12        # tune to your connection; 12 is a reasonable ceiling
 TIMEOUT      = 15        # seconds per request
 CHUNK_SIZE   = 256_000   # 256 KB chunks — fewer syscalls on large zips
+
+# Maximum number of download+integrity attempts per ID before giving up
+MAX_ATTEMPTS = 3
 
 # urllib3 retry on transient network errors (NOT on 404 — handled manually)
 _RETRY = Retry(
@@ -64,15 +67,12 @@ def _session() -> requests.Session:
 # Log helpers
 # ---------------------------------------------------------------------------
 
-# FIX: the original _log() opened and closed the file on every single call —
-# once per downloaded pack. At scale that's thousands of open/close syscalls.
-# A single shared file handle is faster; the write lock makes it thread-safe.
-_log_lock = threading.Lock()
-_log_handle: "IO | None" = None
+_log_lock   = threading.Lock()
+_log_handle = None
 
 def _open_log() -> None:
     global _log_handle
-    _log_handle = open(LOG_FILE, "a", encoding="utf-8", buffering=1)  # line-buffered
+    _log_handle = open(LOG_FILE, "a", encoding="utf-8", buffering=1)
 
 def _close_log() -> None:
     if _log_handle:
@@ -81,9 +81,8 @@ def _close_log() -> None:
 
 def _log(entry: dict) -> None:
     """Append a JSON result entry to the shared log handle (thread-safe)."""
-    line = json.dumps(entry) + "\n"
     with _log_lock:
-        _log_handle.write(line)
+        _log_handle.write(json.dumps(entry) + "\n")
 
 
 def _load_completed() -> set[int]:
@@ -105,6 +104,53 @@ def _load_completed() -> set[int]:
     return done
 
 # ---------------------------------------------------------------------------
+# Integrity check
+# ---------------------------------------------------------------------------
+
+def _integrity_check(extract_path: str) -> str | None:
+    """
+    Lightweight post-extraction integrity check.
+    Returns None on pass, or an error string describing the failure.
+
+    Checks:
+      1. Extract directory exists and is not empty
+      2. productinfo.meta is present and valid JSON
+      3. meta contains required fields: packageId, title, author
+      4. At least one PNG file exists in the directory
+    """
+    # 1. Directory exists and is not empty
+    if not os.path.isdir(extract_path):
+        return "extract directory missing"
+    if not os.listdir(extract_path):
+        return "extract directory is empty"
+
+    # 2. productinfo.meta present and parseable
+    meta_path = os.path.join(extract_path, "productinfo.meta")
+    if not os.path.exists(meta_path):
+        return "productinfo.meta missing"
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except json.JSONDecodeError as e:
+        return f"productinfo.meta invalid JSON: {e}"
+
+    # 3. Required fields present
+    for field in ("packageId", "title", "author"):
+        if field not in meta:
+            return f"productinfo.meta missing field: {field}"
+
+    # 4. At least one PNG exists anywhere in the extracted directory
+    found_png = False
+    for root, _, files in os.walk(extract_path):
+        if any(f.lower().endswith(".png") for f in files):
+            found_png = True
+            break
+    if not found_png:
+        return "no PNG files found in extracted pack"
+
+    return None  # all checks passed
+
+# ---------------------------------------------------------------------------
 # Zip helper
 # ---------------------------------------------------------------------------
 
@@ -116,7 +162,7 @@ def _unzip(sticker_id: int, zip_path: str, extract_path: str) -> str | None:
         return None
     except zipfile.BadZipFile:
         try:
-            os.remove(zip_path)   # corrupt — delete so next run re-downloads
+            os.remove(zip_path)
         except OSError:
             pass
         return "bad zip"
@@ -128,13 +174,7 @@ def _unzip(sticker_id: int, zip_path: str, extract_path: str) -> str | None:
 def _download(sticker_id: int, zip_path: str) -> tuple[str | None, str | None]:
     """
     Try each URL in PACK_URLS in order.
-    Returns (pack_type, error): pack_type is "animated"/"static" on success.
-
-    BUG FIX: the original code returned immediately on ANY RequestException,
-    meaning a timeout or connection error on the animated URL would skip the
-    static URL entirely rather than falling through to try it. Now network
-    errors on one URL fall through to the next just like a 404 does, and only
-    a hard failure on the *last* URL returns an error.
+    Returns (pack_type, error).
     """
     last_err: str | None = None
 
@@ -144,133 +184,126 @@ def _download(sticker_id: int, zip_path: str) -> tuple[str | None, str | None]:
             with _session().get(url, timeout=TIMEOUT, stream=True) as r:
                 if r.status_code == 404:
                     last_err = "not found on any URL"
-                    continue          # try the next URL
+                    continue
                 r.raise_for_status()
-                # Write to a temp path then rename — avoids leaving a partial
-                # zip on disk if the process is killed mid-download, which would
-                # cause the next run to skip the download and try to unzip garbage.
                 tmp_path = zip_path + ".part"
                 try:
                     with open(tmp_path, "wb") as f:
                         for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
                             if chunk:
                                 f.write(chunk)
-                    os.replace(tmp_path, zip_path)   # atomic on POSIX
+                    os.replace(tmp_path, zip_path)
                 except Exception:
                     try:
                         os.remove(tmp_path)
                     except OSError:
                         pass
                     raise
-                return label, None    # success
+                return label, None
         except requests.RequestException as e:
-            # FIX: fall through to next URL instead of returning immediately
             last_err = f"{label} request failed: {e}"
             continue
 
     return None, last_err or "not found on any URL"
 
 
+def _purge_extract(extract_path: str) -> None:
+    """Remove a failed extraction directory so the next attempt starts clean."""
+    import shutil
+    try:
+        if os.path.isdir(extract_path):
+            shutil.rmtree(extract_path)
+    except OSError:
+        pass
+
+
 def process(sticker_id: int) -> dict:
     """
-    Download and unzip one sticker pack, trying PACK_URLS in priority order.
-    Returns a result dict: {id, status, pack_type, message}
+    Download, extract, and integrity-check one sticker pack.
+    On integrity failure, deletes the bad extraction and retries the full
+    download+extract cycle up to MAX_ATTEMPTS times before giving up.
+    Returns a result dict: {id, status, pack_type, message, attempts}
     """
     extract_path = os.path.join(UNZIP_DIR, str(sticker_id))
     zip_path     = os.path.join(DOWNLOAD_DIR, f"{sticker_id}.zip")
 
-    # Already fully extracted from a previous run
+    # Already fully extracted and integrity-checked from a previous run
     if os.path.isdir(extract_path):
-        return {"id": sticker_id, "status": "skip", "pack_type": None,
-                "message": "already extracted"}
+        err = _integrity_check(extract_path)
+        if err is None:
+            return {"id": sticker_id, "status": "skip", "pack_type": None,
+                    "message": "already extracted", "attempts": 0}
+        # Existing extraction is corrupt — purge and re-download
+        _purge_extract(extract_path)
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
 
-    # Download — skip if a complete zip is already on disk
     pack_type = None
-    if not os.path.exists(zip_path):
-        pack_type, err = _download(sticker_id, zip_path)
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+
+        # Download if zip not on disk
+        if not os.path.exists(zip_path):
+            pack_type, err = _download(sticker_id, zip_path)
+            if err:
+                status = "404" if "not found" in err else "fail"
+                return {"id": sticker_id, "status": status, "pack_type": None,
+                        "message": err, "attempts": attempt}
+
+        # Extract
+        err = _unzip(sticker_id, zip_path, extract_path)
         if err:
-            status = "404" if "not found" in err else "fail"
-            return {"id": sticker_id, "status": status, "pack_type": None,
-                    "message": err}
+            # Bad zip — already deleted by _unzip, retry download
+            if attempt < MAX_ATTEMPTS:
+                continue
+            return {"id": sticker_id, "status": "fail", "pack_type": pack_type,
+                    "message": f"bad zip after {attempt} attempt(s)", "attempts": attempt}
 
-    # Unzip
-    err = _unzip(sticker_id, zip_path, extract_path)
-    if err:
-        return {"id": sticker_id, "status": "fail", "pack_type": pack_type,
-                "message": err}
+        # Integrity check
+        err = _integrity_check(extract_path)
+        if err is None:
+            # All good
+            return {"id": sticker_id, "status": "ok", "pack_type": pack_type,
+                    "message": f"downloaded ({pack_type}) & verified",
+                    "attempts": attempt}
 
-    return {"id": sticker_id, "status": "ok", "pack_type": pack_type,
-            "message": f"downloaded ({pack_type}) & extracted"}
+        # Integrity failed — purge and retry
+        _purge_extract(extract_path)
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+
+        if attempt == MAX_ATTEMPTS:
+            return {"id": sticker_id, "status": "fail", "pack_type": pack_type,
+                    "message": f"integrity check failed after {attempt} attempt(s): {err}",
+                    "attempts": attempt}
+
+    # Should not reach here
+    return {"id": sticker_id, "status": "fail", "pack_type": None,
+            "message": "max attempts exceeded", "attempts": MAX_ATTEMPTS}
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Cleanup
 # ---------------------------------------------------------------------------
-
-def main():
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    os.makedirs(UNZIP_DIR, exist_ok=True)
-
-    all_ids   = range(START_ID, END_ID + 1)
-    completed = _load_completed()
-    pending   = [i for i in all_ids if i not in completed]
-
-    total = END_ID - START_ID + 1
-    print(f"Range: {START_ID} → {END_ID}  ({total:,} total, "
-          f"{len(completed):,} already done, {len(pending):,} to process)")
-
-    if not pending:
-        print("Nothing to do.")
-        return
-
-    counts = {"ok": 0, "404": 0, "skip": 0, "fail": 0}
-
-    _open_log()
-    try:
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(process, i): i for i in pending}
-
-            with tqdm(total=len(pending), unit="pack", dynamic_ncols=True) as bar:
-                for future in as_completed(futures):
-                    result = future.result()
-                    _log(result)
-
-                    status = result["status"]
-                    counts[status] = counts.get(status, 0) + 1
-
-                    bar.set_postfix(
-                        ok=counts["ok"],
-                        f404=counts["404"],
-                        fail=counts["fail"],
-                        refresh=False,
-                    )
-                    bar.update(1)
-    finally:
-        _close_log()
-
-
 
 def _cleanup_downloads(counts: dict) -> None:
     """
-    Remove the downloads folder and all zips inside it, but only when it is
-    safe to do so:
-      - No failures (counts["fail"] == 0) — failed packs may have a partial
-        zip on disk that the next run needs to overwrite cleanly.
-      - No outstanding .part files — indicates a download was interrupted.
-      - The downloads folder actually exists.
-
-    If any condition isn't met, we leave the folder alone and tell the user why.
+    Remove the downloads folder once the run is fully complete with no failures.
+    Keeps the folder if any failures occurred so the next run can resume.
     """
     import shutil
 
     if not os.path.isdir(DOWNLOAD_DIR):
-        return  # nothing to clean up
+        return
 
     if counts.get("fail", 0) > 0:
         print(f"Keeping {DOWNLOAD_DIR}/ — {counts['fail']} failed pack(s) "
               f"may have partial zips needed for resume.")
         return
 
-    # Check for any leftover .part files from interrupted downloads
     part_files = [f for f in os.listdir(DOWNLOAD_DIR) if f.endswith(".part")]
     if part_files:
         print(f"Keeping {DOWNLOAD_DIR}/ — {len(part_files)} incomplete "
@@ -284,6 +317,9 @@ def _cleanup_downloads(counts: dict) -> None:
     except OSError as e:
         print(f"Could not remove {DOWNLOAD_DIR}/: {e}")
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main():
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
